@@ -1,9 +1,10 @@
 import json
 from sqlalchemy import select,func
 from src.config.database import initialize,Session
-from src.models import ArchiveLot,SamplingPlan,AllocationRun,SampleDraw,ReviewDecision,Report,User
+from src.models import ArchiveLot,SamplingPlan,AllocationRun,SampleDraw,ReviewDecision,CheckItem,Report,User
 from src.utils.security import hash_password
 from src.services.run_service import compute
+from src.services.review_service import coverage
 
 def seed():
  initialize()
@@ -21,9 +22,32 @@ def seed():
   db.commit()
   if not db.get(AllocationRun,"demo-run"):db.add(AllocationRun(id="demo-run",plan_id="demo-plan",status="queued",result={},error=""));db.commit();compute(db,"demo-run")
   draw=db.scalar(select(SampleDraw).where(SampleDraw.run_id=="demo-run"))
-  if draw and not db.get(ReviewDecision,"demo-review"):db.add(ReviewDecision(id="demo-review",draw_id=draw.id,action="核对四层抽样口径与预算，按不可变文档编号复核；检出率依赖预估差错数假设，不代表质量保证。",state="approved",reviewer="admin@sample.demo"))
+  if draw and not db.get(ReviewDecision,"demo-review"):
+   review=ReviewDecision(id="demo-review",draw_id=draw.id,action="逐份登记离线复核结果并按层汇总实测差错；检出率设计值依赖预估差错数假设，置信上界仅依据实测数据。",state="submitted",reviewer="")
+   db.add(review);db.commit()
+   # 离线两批报送：复核员A全量初判；复核员B对其中两份复查，制造一处矛盾后由管理员裁决
+   error_docs={row["document_id"] for idx,row in enumerate(draw.manifest) if idx%37==0}
+   for row in draw.manifest:
+    result="error" if row["document_id"] in error_docs else "qualified"
+    db.add(CheckItem(id="check-a-"+str(row["position"]),review_id=review.id,document_id=row["document_id"],result=result,source="reviewer-a",note="离线初检",raw_payload={}))
+   conflict_doc=draw.manifest[5]["document_id"]
+   conflict_result="error" if conflict_doc not in error_docs else "qualified"
+   db.add(CheckItem(id="check-b-conflict",review_id=review.id,document_id=conflict_doc,result=conflict_result,source="reviewer-b",note="离线复查结论不一致，保留冲突待裁决",raw_payload={}))
+   db.commit()
+   summary=coverage(db,review)
+   # 管理员裁决冲突文档（采用复核员A口径），随后全部清单满足批准闸门
+   target=next(c for c in summary["conflicts"] if c["document_id"]==conflict_doc)
+   adj_result=next(e["result"] for e in target["entries"] if e["source"]=="reviewer-a")
+   from src.schemas.review import ConflictResolve
+   from src.services.review_service import resolve_conflict
+   class _Admin:email="admin@sample.demo";role="admin"
+   resolve_conflict(db,review,ConflictResolve(document_id=conflict_doc,result=adj_result,note="采纳复核员A初检结论"),_Admin())
+  review=db.get(ReviewDecision,"demo-review")
+  if draw and review and review.state!="sealed" and not db.get(Report,"demo-report"):
+   review.state="approved";review.reviewer="admin@sample.demo";db.commit()
+   from src.services.report_service import create as create_report
+   from src.schemas.report import ReportCreate
+   create_report(db,ReportCreate(review_id="demo-review",title="四层档案复核抽样底册"))
   db.commit()
-  if draw and not db.get(Report,"demo-report"):db.add(Report(id="demo-report",review_id="demo-review",title="四层档案复核抽样底册",snapshot={"manifest":draw.manifest,"allocation":db.get(AllocationRun,"demo-run").result,"action":db.get(ReviewDecision,"demo-review").action,"reviewer":"admin@sample.demo"}))
-  db.commit()
-  return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in [User,ArchiveLot,SamplingPlan,AllocationRun,SampleDraw,ReviewDecision,Report]}
+  return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in [User,ArchiveLot,SamplingPlan,AllocationRun,SampleDraw,ReviewDecision,CheckItem,Report]}
 if __name__=="__main__":print(json.dumps(seed(),ensure_ascii=False))

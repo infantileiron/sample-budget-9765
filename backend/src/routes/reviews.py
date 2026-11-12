@@ -1,7 +1,7 @@
 from fastapi import APIRouter,Depends
 from ..config.database import get_db
 from ..utils.auth import current,write_user,admin
-from ..schemas.review import ReviewCreate
+from ..schemas.review import ReviewCreate,CheckBatch,ConflictResolve
 from ..controllers import review_controller as controller,common
 from ..models.review import ReviewDecision
 from ..models.common import serialize
@@ -12,6 +12,14 @@ def listing(db=Depends(get_db),user=Depends(current)):return controller.list_all
 def detail(ident:str,db=Depends(get_db),user=Depends(current)):return controller.detail(db,ident)
 @router.post("",status_code=201)
 def create(body:ReviewCreate,db=Depends(get_db),user=Depends(write_user)):return controller.create(db,body)
+@router.get("/{ident}/coverage")
+def coverage(ident:str,db=Depends(get_db),user=Depends(current)):return controller.coverage(db,ident)
+@router.post("/{ident}/checks")
+def merge_checks(ident:str,body:CheckBatch,db=Depends(get_db),user=Depends(write_user)):
+ return controller.merge(db,ident,body,user)
+@router.post("/{ident}/conflicts/resolve")
+def resolve_conflict(ident:str,body:ConflictResolve,db=Depends(get_db),user=Depends(admin)):
+ return controller.resolve(db,ident,body,user)
 from ..services.review_service import approve
 @router.post("/{ident}/approve")
 def approve_review(ident:str,db=Depends(get_db),user=Depends(admin)):

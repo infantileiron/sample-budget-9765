@@ -6,7 +6,17 @@
 
 原流程用 `guanlan_acceptance_202611.csv` 在Excel统一抽10%。三个痛点是小批次无放回概率误算、风险层样本分配缺少依据、临时加样使预算超支。上游为数字化批次底册和历史预估差错率；本项目替代抽样设计、预算复核和编号留档；下游为人工复核员逐份检查、验收负责人审核。
 
-六实体贯穿数据库、Python Model/Schema/Service/Controller/Route和Vue API/Store/页面：ArchiveLot（批次）、SamplingPlan（计划）、AllocationRun（可行性与配额）、SampleDraw（具体抽样）、ReviewDecision（人工复核）、Report（批准快照）。风险层为批次属性，同一层内合并所选批次作等概率抽样。
+六实体贯穿数据库、Python Model/Schema/Service/Controller/Route和Vue API/Store/页面：ArchiveLot（批次）、SamplingPlan（计划）、AllocationRun（可行性与配额）、SampleDraw（具体抽样）、ReviewDecision（人工复核）、CheckItem（逐份检查结果）、Report（批准快照）。风险层为批次属性，同一层内合并所选批次作等概率抽样。
+
+## 逐份复核与批准闸门
+
+说明文字不能代替逐份检查。每个抽样清单建立复核单后，必须对清单内**每一份**档案登记 `qualified`（合格）或 `error`（差错），漏检或冲突未清的清单不能批准：
+
+- **离线结果合并**：按 `source`（复核员/离线设备标识）批量报送，支持粘贴 `文档编号,合格|差错` 文本导入。同一 `(复核单, 文档, 来源)` 重复报送幂等不增计，仅以最新报送覆盖同来源结论与备注。
+- **矛盾结论保留冲突**：不同来源对同一文档给出相反结论时，全部条目保留并标记冲突，进入管理员裁决队列；冲突文档不计入合格也不计入差错。
+- **管理员裁决**：仅 admin 可裁决，裁决写入 `adjudication` 来源条目，被否定的原始条目标记 `superseded` 留痕，可重新裁决。
+- **批准闸门**：`POST /reviews/{id}/approve` 校验漏检数与未裁决冲突数均为 0，否则 409；批准后结果锁定，拒绝再登记或再裁决。
+- **封存**：生成报告即封存，复核单转为 `sealed`，逐份结论、来源、裁决留痕与统计口径写入 `reviews.sealed_evidence` 与 `reports.snapshot`，CSV 含逐份证据段。
 
 ## 启动
 
@@ -32,7 +42,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 | 网关 | Nginx1.28、SPA回落及API代理 |
 
 - `backend/src/models,schemas,services,controllers,routes`：按六实体分层。
-- `services/hypergeometric.py`：漏检概率/最小样本量；`neyman.py`：整数配额；`allocation.py`：风险层汇总/可行性；`draw_service.py`：具体文档编号。
+- `services/hypergeometric.py`：漏检概率/最小样本量；`neyman.py`：整数配额；`allocation.py`：风险层汇总/可行性；`draw_service.py`：具体文档编号；`confidence.py`：实测差错的有限总体单侧95%置信上界；`review_service.py`：离线合并、去重、冲突裁决与批准闸门。
+- `models/check.py`（CheckItem）：逐份合格/差错登记，唯一键 `(review_id, document_id, source)` 保证同来源幂等；`reviews.sealed_evidence` 保存封存证据。
 - `config,utils,middlewares`：环境变量、数据库、认证、队列、审计及统一错误。
 - `backend/scripts/seed_demo.py`：自然键幂等；`migrations/001_schema.sql`：新库基线说明，以SQLAlchemy元数据建表。
 - `frontend/src/api,stores,types,constants,hooks,pages,router`：完整业务入口；共享AllocationTable、QuotaBars、ManifestTable分别跨总览/配额/归档复用。
@@ -48,17 +59,29 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 | 账号/角色 | 主要动作 | 权限 |
 |---|---|---|
-| admin@sample.demo / admin | 核准复核、归档、审计 | 全部分析写入与批准归档 |
-| analyst@sample.demo / analyst | 批次、计划、计算、清单、提交复核 | 不能批准或归档 |
+| admin@sample.demo / admin | 核准复核、冲突裁决、归档、审计 | 全部分析写入、裁决与批准封存 |
+| analyst@sample.demo / analyst | 批次、计划、计算、清单、逐份登记与离线合并 | 不能裁决、批准或归档 |
 | viewer@sample.demo / viewer | 阅读和下载已批准清单 | 所有写入403 |
 
-未认证401；错误角色403；不可行运行生成抽样409；未批准复核生成报告409。同一运行重复生成清单返回原清单，同一批准复核重复归档返回原快照。
+未认证401；错误角色403；不可行运行生成抽样409；未批准复核生成报告409；漏检或冲突未清批准409；已封存复核再登记409；清单外文档报送422。同一运行重复生成清单返回原清单，同一批准复核重复归档返回原快照。
 
-共享枚举：Role/RunStatus/Stratum在 `backend/src/constants/enums.py`；前端roles/runStatuses/strata及strataLabels在 `frontend/src/constants/enums.ts`；Role类型见types/domain.ts。状态包括queued、running、completed、infeasible、failed。
+共享枚举：Role/RunStatus/Stratum在 `backend/src/constants/enums.py`；前端roles/runStatuses/strata及strataLabels在 `frontend/src/constants/enums.ts`；Role类型见types/domain.ts。运行状态包括queued、running、completed、infeasible、failed；复核状态submitted（待复核）、approved（已批准锁定）、sealed（已封存证据）。检查条目状态active（有效）、superseded（裁决后被否定留痕）。
 
 ## 统计口径
 
-### 风险层与假设差错数
+### 复核后的实测差错置信上界
+
+批准报告**不沿用抽样设计阶段的预估差错率/假设 D**，仅依据逐份实检结果。按风险层汇总层总体 N、实检份数 n、实测差错数 d，对总体差错总量 D 求 95% 单侧置信上界 U（Clopper–Pearson 型超几何口径）：
+
+`U = min{ D : P_{N,D,n}(X <= d) <= 0.05 }`，其中 `P(X=k)=C(D,k)C(N−D,n−k)/C(N,n)`。
+
+- 整数二分求解，组合数用任意精度整数、Fraction 交叉相乘比较，无浮点相消。
+- **零差错照算**：d=0 时 U 为满足 `C(N−U,n)/C(N,n) <= 0.05` 的最小 U，不报零。
+- 全检 n=N 时 U=d（总体差错数即观测值）；n=0 时无样本信息，U=N。
+- 边界例：N=100、n=20、d=0 时 U=13（P(X=0|D=13)≈0.0443，D=12 时≈0.0574）；大总体小抽样比下与二项 CP 上界吻合。
+- 设计阶段的假设 D、检出率仅作留档列，报告中明确标注 `design_only`，不参与实测结论。
+
+### 风险层与假设差错数（抽样设计阶段）
 
 每批记录文档总数N_lot、预估差错率p_lot、风险层及唯一文档前缀。文档编号为 `PREFIX-00001` 起连续序号。本项目不读取真实档案内容，也没有隐藏的真实差错标签。
 
@@ -86,16 +109,16 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 ## 模拟数据与工作日
 
-12批、1800份档案：4风险层，每层100/150/200份三批；p分别0.01/0.03/0.06/0.12。默认计划预算480，目标95%，seed20261112。
+12批、1800份档案：4风险层，每层100/150/200份三批；p分别0.01/0.03/0.06/0.12。默认计划预算480，目标95%，seed20261112。演示复核含两来源离线报送、一处矛盾结论及管理员裁决，批准后封存为已归档报告（482条检查记录）。
 
 1. 09:00 核对 `guanlan_acceptance_202611.csv` 与12批底册的份数和前缀。
 2. 09:04 复查预估差错率来源，确认四层口径而非逐批保证。
 3. 09:08 设置95%目标、480份预算和固定seed。
 4. 09:11 送入Redis队列，检查最低预算与可行性。
 5. 09:16 查看Neyman整数配额、层容量及实际检出概率。
-6. 09:20 打开具体文档清单，按编号分发人工复核，不刷新重抽。
-7. 09:25 分析师提交假设、预算与抽样依据，管理员核准。
-8. 09:30 下载批准快照CSV，保留文档编号、N/D、配额与检出率。
+6. 09:20 打开具体文档清单，建立复核单，逐份登记合格/差错并按来源合并离线结果。
+7. 09:25 管理员裁决矛盾结论；漏检或冲突未清时批准按钮禁用，清结后核准并锁定。
+8. 09:30 生成归档快照封存逐份证据，下载含实测差错、95%单侧上界与逐份留痕的CSV。
 
 种子按自然键检测，重复执行不新增或覆盖用户修改。密码、Token、原始请求正文不会写入审计。
 

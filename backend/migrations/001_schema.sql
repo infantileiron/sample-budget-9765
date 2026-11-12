@@ -1,3 +1,8 @@
--- New MySQL database baseline: SQLAlchemy metadata creates lots, plans, runs, draws, reviews, reports, users, audits.
--- JSON columns retain selected batch IDs, feasible/infeasible allocation evidence and immutable sampled-document manifests.
+-- New MySQL database baseline: SQLAlchemy metadata creates lots, plans, runs, draws,
+-- reviews, check_items, reports, users, audits.
+-- JSON columns retain selected batch IDs, feasible/infeasible allocation evidence,
+-- immutable sampled-document manifests and sealed per-document review evidence.
+-- check_items 逐份登记合格/差错结论，(review_id, document_id, source) 维度支持离线合并；
+-- 同来源重复报送幂等不增计，跨来源矛盾结论全部保留并由 adjudication 来源记录管理员裁决。
+-- reviews 新增 sealed_at / sealed_evidence：批准后封存，reports.snapshot 同步保存不可变证据。
 -- Existing deployments require a reviewed schema migration; destructive automatic upgrades are not provided.
